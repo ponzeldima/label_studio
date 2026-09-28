@@ -1,0 +1,21 @@
+.env
+.env.*
+!.env.example
+
+# Runtime state and data
+mydata/
+postgres-data/
+models/
+coco-dataset/
+dataset-hub-exports/
+
+# Python and editor artifacts
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.vscode/
+
+# Generated credentials
+frame-extractor-proxy/.htpasswd
+dataset-hub-proxy/.htpasswd

@@ -1,0 +1,32 @@
+<View style="display: flex; flex-direction: row; justify-content: space-between; align-items: flex-start;">
+  
+  <!-- Ліва колонка: Зображення -->
+  <View style="flex: 1 1 75%; margin-right: 15px;">
+    <Image name="image" value="$image"/>
+  </View>
+
+  <!-- Права колонка: Інструменти та теги -->
+  <View style="flex: 0 0 23%; max-width: 23%;">
+     <Header value="Tags" style="font-size: 14px; margin-bottom: 5px;"/>
+    <Choices name="tags" toName="image" choice="multiple" layout="vertical">
+        <Choice value="d_3_5"/>
+        <Choice value="summer"/>
+        <Choice value="sunny"/>
+        <Choice value="sunset"/>
+        <Choice value="cloudy"/>
+        <Choice value="b_green"/>
+        <Choice value="day"/>
+        <Choice value="b_sky"/>
+        <Choice value="b_building"/>
+        <Choice value="ir"/>
+        <Choice value="b_ground"/>    
+    </Choices>
+
+    <Header value="Classes" style="font-size: 14px; margin-top: 15px; margin-bottom: 5px;"/>
+    <RectangleLabels name="label" toName="image" model_score_threshold="0.25">
+      <Label value="fpv" background="#ff0d00"/>
+      <Label value="bird" background="#00ff1e"/>
+    </RectangleLabels>
+  </View>
+
+</View>

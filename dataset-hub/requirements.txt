@@ -1,0 +1,6 @@
+label-studio-sdk==2.0.0
+opencv-python-headless==4.10.0.84
+psycopg[binary]==3.2.1
+requests==2.32.3
+streamlit==1.42.0
+streamlit-cropper==0.2.2
