@@ -1,0 +1,19 @@
+ponzel-vision.westeurope.cloudapp.azure.com {
+    encode zstd gzip
+
+    header {
+        -Server
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "strict-origin-when-cross-origin"
+    }
+
+    @datasetHub path /dataset-hub /dataset-hub/*
+    handle @datasetHub {
+        reverse_proxy dataset-hub-proxy:80
+    }
+
+    handle {
+        reverse_proxy app:8080
+    }
+}

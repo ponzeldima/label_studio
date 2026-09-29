@@ -1321,7 +1321,7 @@ def render_dataset_export() -> None:
     if archive_path := st.session_state.get("yolo_archive_path"):
         counts = st.session_state.get("yolo_counts", {})
         # Served as a static file by dataset-hub-proxy so the ZIP never has to be loaded into Streamlit's memory.
-        st.link_button("Download YOLO dataset (.zip)", f"/downloads/{Path(archive_path).name}", type="primary")
+        st.link_button("Download YOLO dataset (.zip)", f"/dataset-hub/downloads/{Path(archive_path).name}", type="primary")
         st.caption(f"Ready: {counts.get('train', 0)} train, {counts.get('valid', 0)} validation, {counts.get('test', 0)} test images.")
 
 

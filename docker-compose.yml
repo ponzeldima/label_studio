@@ -1,8 +1,6 @@
 services:
   app:
     image: heartexlabs/label-studio:1.23.0
-    ports:
-      - "8080:8080"
     environment:
       - JSON_LOG=${JSON_LOG:-1}
 
@@ -19,6 +17,7 @@ services:
       - LOCAL_FILES_SERVING_ENABLED=${LOCAL_FILES_SERVING_ENABLED:-true}
       - LOCAL_FILES_DOCUMENT_ROOT=${LOCAL_FILES_DOCUMENT_ROOT:-/label-studio/data}
       - LABEL_STUDIO_LOCAL_FILES_DOCUMENT_ROOT=${LABEL_STUDIO_LOCAL_FILES_DOCUMENT_ROOT:-/label-studio/data}
+      - CSRF_TRUSTED_ORIGINS=https://ponzel-vision.westeurope.cloudapp.azure.com
 
     volumes:
       - ./mydata:/label-studio/data
@@ -38,8 +37,6 @@ services:
   ml:
     build:
       context: ./ml
-    ports:
-      - "9090:9090"
     environment:
       - WORKERS=1
       - THREADS=4
@@ -78,8 +75,6 @@ services:
   dataset-hub-proxy:
     build:
       context: ./dataset-hub-proxy
-    ports:
-      - "8501:80"
     environment:
       - BASIC_AUTH_USERNAME=${FRAME_EXTRACTOR_USERNAME}
       - BASIC_AUTH_PASSWORD=${FRAME_EXTRACTOR_PASSWORD}
@@ -88,5 +83,20 @@ services:
     depends_on:
       - dataset-hub
 
+  caddy:
+    image: caddy:2.8.4-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - app
+      - dataset-hub-proxy
+
 volumes:
   dataset-hub-exports:
+  caddy-data:
+  caddy-config:

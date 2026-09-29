@@ -35,8 +35,33 @@ database directly.
    docker compose ps
    ```
 
-The Label Studio UI is exposed on port `8080`. The dataset-hub proxy is exposed
-on port `8501`.
+## HTTPS deployment
+
+The public TLS endpoint is configured for
+`ponzel-vision.westeurope.cloudapp.azure.com`. Before starting the updated stack:
+
+1. Ensure the Azure DNS hostname resolves to the Azure load-balancer public IP.
+2. In Azure, forward inbound TCP ports 80 and 443 to this VM and allow them in
+   the VM's network security group. Remove public forwarding for ports 8080,
+   8501, and 9090.
+3. Restrict the credentials file to the deployment account:
+
+   ```bash
+   chmod 600 .env
+   ```
+
+4. Start the updated stack:
+
+   ```bash
+   docker compose up --build -d
+   docker compose ps
+   ```
+
+Caddy automatically obtains and renews the TLS certificate. Label Studio is
+available at `https://ponzel-vision.westeurope.cloudapp.azure.com`; the
+authenticated dataset hub is at
+`https://ponzel-vision.westeurope.cloudapp.azure.com/dataset-hub/`. Only Caddy
+publishes host ports.
 
 ## Back up before upgrades or database changes
 
