@@ -17,3 +17,16 @@ ponzel-vision.westeurope.cloudapp.azure.com {
         reverse_proxy app:8080
     }
 }
+
+ponzel-vision.westeurope.cloudapp.azure.com:8443 {
+    encode zstd gzip
+
+    header {
+        -Server
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "strict-origin-when-cross-origin"
+    }
+
+    reverse_proxy app-freelance:8080
+}

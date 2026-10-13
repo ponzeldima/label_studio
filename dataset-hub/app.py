@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import re
 import shutil
 import tempfile
@@ -11,7 +12,8 @@ import uuid
 import zipfile
 import os
 from collections import defaultdict
-from math import ceil
+from dataclasses import dataclass
+from math import ceil, floor
 from datetime import datetime
 from pathlib import Path
 from random import Random
@@ -28,40 +30,93 @@ from label_studio_sdk.core.api_error import ApiError
 from PIL import Image
 from streamlit_cropper import st_cropper
 
-DATA_DIR = Path("/data")
-IMAGES_DIR = DATA_DIR / "images"
 STAGING_ROOT = Path("/tmp/frame-staging")
 UPLOAD_ROOT = Path("/tmp/frame-uploads")
 EXPORT_ROOT = Path("/tmp/dataset-export")
+ARCHIVE_SCHEMA_VERSION = 1
+MAX_ARCHIVE_UNCOMPRESSED_BYTES = 10 * 1024 * 1024 * 1024
 FRAMES_PER_PAGE = 24
 MAX_SUBFOLDER_LENGTH = 80
 PREVIEW_WIDTH = 360
-LABEL_STUDIO_URL = os.getenv("LABEL_STUDIO_URL", "http://app:8080")
-LABEL_STUDIO_API_TOKEN = os.getenv("LABEL_STUDIO_API_TOKEN", "")
-LABEL_STUDIO_PROJECT_ID = int(os.getenv("LABEL_STUDIO_PROJECT_ID", "1"))
 DATA_SOURCE = os.getenv("DATA_SOURCE", "api").strip().lower()
 if DATA_SOURCE not in {"api", "postgres"}:
     DATA_SOURCE = "api"
-POSTGRES_HOST = os.getenv("POSTGRES_HOST", "db")
-POSTGRES_DB = os.getenv("POSTGRES_DB", "postgres")
-POSTGRES_USER = os.getenv("POSTGRES_USER", "postgres")
-POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "")
-POSTGRES_PORT = int(os.getenv("POSTGRES_PORT", "5432"))
 CLASS_IDS = {"fpv": 0, "bird": 1}
 # Errors that can surface from any Label Studio API call (SDK-raised or raw httpx/requests).
 LS_API_ERRORS = (RuntimeError, requests.RequestException, httpx.HTTPError, ApiError)
 
 
-def configured_label_studio() -> tuple[str, str]:
-    return LABEL_STUDIO_URL.rstrip("/"), LABEL_STUDIO_API_TOKEN
+@dataclass(frozen=True)
+class LabelStudioInstance:
+    key: str
+    label: str
+    data_dir: Path
+    url: str
+    api_token: str
+    project_id: int
+    postgres_host: str
+    postgres_db: str
+    postgres_user: str
+    postgres_password: str
+    postgres_port: int
 
 
-def configured_postgres() -> tuple[str, str, str, str, int]:
-    return POSTGRES_HOST, POSTGRES_DB, POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_PORT
+LABEL_STUDIO_INSTANCES = {
+    "main": LabelStudioInstance(
+        key="main",
+        label="Main Label Studio",
+        data_dir=Path(os.getenv("MAIN_DATA_DIR", "/data/main")),
+        url=os.getenv("LABEL_STUDIO_URL", "http://app:8080"),
+        api_token=os.getenv("LABEL_STUDIO_API_TOKEN", ""),
+        project_id=int(os.getenv("LABEL_STUDIO_PROJECT_ID", "1")),
+        postgres_host=os.getenv("POSTGRES_HOST", "db"),
+        postgres_db=os.getenv("POSTGRES_DB", "postgres"),
+        postgres_user=os.getenv("POSTGRES_USER", "postgres"),
+        postgres_password=os.getenv("POSTGRES_PASSWORD", ""),
+        postgres_port=int(os.getenv("POSTGRES_PORT", "5432")),
+    ),
+    "freelance": LabelStudioInstance(
+        key="freelance",
+        label="Freelancer Label Studio",
+        data_dir=Path(os.getenv("FREELANCE_DATA_DIR", "/data/freelance")),
+        url=os.getenv("FREELANCE_LABEL_STUDIO_URL", "http://app-freelance:8080"),
+        api_token=os.getenv("FREELANCE_LABEL_STUDIO_API_TOKEN", ""),
+        project_id=int(os.getenv("FREELANCE_LABEL_STUDIO_PROJECT_ID", "1")),
+        postgres_host=os.getenv("FREELANCE_POSTGRES_HOST", "db-freelance"),
+        postgres_db=os.getenv("FREELANCE_POSTGRES_DB", "postgres"),
+        postgres_user=os.getenv("FREELANCE_POSTGRES_USER", "postgres"),
+        postgres_password=os.getenv("FREELANCE_POSTGRES_PASSWORD", ""),
+        postgres_port=int(os.getenv("FREELANCE_POSTGRES_PORT", "5432")),
+    ),
+}
 
 
-def postgres_connection():
-    host, dbname, user, password, port = configured_postgres()
+def selected_instance_key() -> str:
+    return st.session_state.get("label_studio_instance", "main")
+
+
+def selected_instance() -> LabelStudioInstance:
+    return LABEL_STUDIO_INSTANCES[selected_instance_key()]
+
+
+def configured_label_studio(instance: LabelStudioInstance | None = None) -> tuple[str, str]:
+    target = instance or selected_instance()
+    return target.url.rstrip("/"), target.api_token
+
+
+def configured_postgres(instance: LabelStudioInstance | None = None) -> tuple[str, str, str, str, int]:
+    target = instance or selected_instance()
+    return (
+        target.postgres_host,
+        target.postgres_db,
+        target.postgres_user,
+        target.postgres_password,
+        target.postgres_port,
+    )
+
+
+def postgres_connection(instance: LabelStudioInstance | None = None):
+    host, dbname, user, password, port = configured_postgres(instance)
     return psycopg.connect(
         host=host,
         dbname=dbname,
@@ -72,10 +127,11 @@ def postgres_connection():
     )
 
 
-def label_studio_client() -> LabelStudio:
-    base_url, token = configured_label_studio()
+def label_studio_client(instance: LabelStudioInstance | None = None) -> LabelStudio:
+    target = instance or selected_instance()
+    base_url, token = configured_label_studio(target)
     if not token:
-        raise RuntimeError("Set LABEL_STUDIO_API_TOKEN in .env and restart dataset-hub.")
+        raise RuntimeError(f"Set the API token for {target.label} in .env and restart dataset-hub.")
     return LabelStudio(base_url=base_url, api_key=token)
 
 
@@ -98,15 +154,16 @@ CHOICE_VALUE_RE = re.compile(r'<Choice\b[^>]*\bvalue="([^"]*)"')
 
 
 def load_label_config() -> str:
+    instance = selected_instance()
     if DATA_SOURCE == "postgres":
-        with postgres_connection() as conn:
+        with postgres_connection(instance) as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT label_config FROM project WHERE id = %s", (LABEL_STUDIO_PROJECT_ID,))
+                cur.execute("SELECT label_config FROM project WHERE id = %s", (instance.project_id,))
                 row = cur.fetchone()
         if not row:
-            raise RuntimeError(f"Project {LABEL_STUDIO_PROJECT_ID} not found.")
+            raise RuntimeError(f"Project {instance.project_id} not found in {instance.label}.")
         return row[0] or ""
-    project = sdk_dict(label_studio_client().projects.get(LABEL_STUDIO_PROJECT_ID))
+    project = sdk_dict(label_studio_client(instance).projects.get(instance.project_id))
     return str(project.get("label_config") or "")
 
 
@@ -126,7 +183,8 @@ def update_label_config_tags(label_config: str, tags: list[str]) -> str:
 
 
 def save_label_config(new_config: str) -> None:
-    label_studio_client().projects.update(LABEL_STUDIO_PROJECT_ID, label_config=new_config)
+    instance = selected_instance()
+    label_studio_client(instance).projects.update(instance.project_id, label_config=new_config)
 
 
 def find_tags_result(result: list[dict[str, object]]) -> dict[str, object] | None:
@@ -225,12 +283,13 @@ def apply_tags_to_tasks(
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def load_storages() -> list[dict[str, object]]:
+def load_storages(instance_key: str) -> list[dict[str, object]]:
+    instance = LABEL_STUDIO_INSTANCES[instance_key]
     if DATA_SOURCE == "postgres":
-        return load_storages_postgres()
-    client = label_studio_client()
+        return load_storages_postgres(instance)
+    client = label_studio_client(instance)
     storages: list[dict[str, object]] = []
-    for storage in client.import_storage.local.list(project=LABEL_STUDIO_PROJECT_ID):
+    for storage in client.import_storage.local.list(project=instance.project_id):
         storage_data = sdk_dict(storage)
         storage_data["storage_type"] = "localfiles"
         storages.append(storage_data)
@@ -238,13 +297,17 @@ def load_storages() -> list[dict[str, object]]:
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def load_project_tasks(project_id: int) -> list[dict[str, object]]:
+def load_project_tasks(instance_key: str) -> list[dict[str, object]]:
+    instance = LABEL_STUDIO_INSTANCES[instance_key]
     if DATA_SOURCE == "postgres":
-        return load_project_tasks_postgres(project_id)
-    return [sdk_dict(task) for task in label_studio_client().tasks.list(project=project_id, page_size=1000)]
+        return load_project_tasks_postgres(instance, instance.project_id)
+    return [
+        sdk_dict(task)
+        for task in label_studio_client(instance).tasks.list(project=instance.project_id, page_size=1000)
+    ]
 
 
-def load_storages_postgres() -> list[dict[str, object]]:
+def load_storages_postgres(instance: LabelStudioInstance) -> list[dict[str, object]]:
     query = """
         SELECT
             localfilesmixin_ptr_id AS id,
@@ -258,9 +321,9 @@ def load_storages_postgres() -> list[dict[str, object]]:
         WHERE project_id = %s
         ORDER BY id
     """
-    with postgres_connection() as conn:
+    with postgres_connection(instance) as conn:
         with conn.cursor() as cur:
-            cur.execute(query, (LABEL_STUDIO_PROJECT_ID,))
+            cur.execute(query, (instance.project_id,))
             rows = cur.fetchall()
     storages: list[dict[str, object]] = []
     for row in rows:
@@ -278,7 +341,9 @@ def load_storages_postgres() -> list[dict[str, object]]:
     return storages
 
 
-def load_project_tasks_postgres(project_id: int) -> list[dict[str, object]]:
+def load_project_tasks_postgres(
+    instance: LabelStudioInstance, project_id: int
+) -> list[dict[str, object]]:
     query = """
         SELECT
             t.id,
@@ -304,7 +369,7 @@ def load_project_tasks_postgres(project_id: int) -> list[dict[str, object]]:
         WHERE t.project_id = %s
         ORDER BY t.id
     """
-    with postgres_connection() as conn:
+    with postgres_connection(instance) as conn:
         with conn.cursor() as cur:
             cur.execute(query, (project_id,))
             rows = cur.fetchall()
@@ -420,7 +485,7 @@ def image_bytes(task: dict[str, object]) -> tuple[bytes, str]:
     if not image:
         raise RuntimeError("Task does not contain an image field.")
     image_path = unquote(image.split("?d=", 1)[1]) if "?d=" in image else ""
-    local_path = DATA_DIR / image_path
+    local_path = selected_instance().data_dir / image_path
     if image_path and local_path.is_file():
         return local_path.read_bytes(), local_path.suffix or ".jpg"
     base_url, token = configured_label_studio()
@@ -439,6 +504,404 @@ def task_source_filename(task: dict[str, object]) -> str:
     image_path = reference.split("?d=", 1)[1] if "?d=" in reference else urlparse(reference).path
     filename = Path(unquote(image_path.split("?", 1)[0])).name
     return filename or f"task_{task.get('id', 'unknown')}"
+
+
+def storage_archive_name(storage: dict[str, object]) -> str:
+    return safe_filename(str(storage.get("title") or f"storage-{storage['id']}"))
+
+
+def task_storage_relative_path(task: dict[str, object], storage: dict[str, object]) -> Path:
+    reference = task_image_reference(task)
+    if not reference:
+        raise RuntimeError(f"Task {task.get('id')} does not contain an image field.")
+    image_path = unquote(reference.split("?d=", 1)[1]) if "?d=" in reference else urlparse(reference).path
+    image_path = image_path.split("?", 1)[0].lstrip("/")
+    if not image_path:
+        raise RuntimeError(f"Task {task.get('id')} has an empty image path.")
+    storage_path = str(storage.get("path") or storage.get("prefix") or "").rstrip("/")
+    marker = "/data/"
+    storage_relative = storage_path.split(marker, 1)[1].strip("/") if marker in storage_path else ""
+    if storage_relative and image_path.startswith(storage_relative + "/"):
+        image_path = image_path[len(storage_relative) + 1:]
+    path = Path(image_path)
+    if path.is_absolute() or ".." in path.parts:
+        raise RuntimeError(f"Task {task.get('id')} has an unsafe image path.")
+    storage_name = storage_archive_name(storage)
+    for prefix in (("images", storage_name), (storage_name,)):
+        if path.parts[:len(prefix)] == prefix:
+            path = Path(*path.parts[len(prefix):])
+            break
+    if path == Path("."):
+        raise RuntimeError(f"Task {task.get('id')} has an empty storage-relative image path.")
+    return path
+
+
+def archive_member_path(storage_name: str, relative_path: Path) -> str:
+    return f"{storage_name}/images/{relative_path.as_posix()}"
+
+
+def percentile(values: list[float], fraction: float) -> float:
+    ordered = sorted(values)
+    if not ordered:
+        return 0.0
+    position = (len(ordered) - 1) * fraction
+    lower = floor(position)
+    upper = ceil(position)
+    if lower == upper:
+        return ordered[lower]
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
+
+
+def distribution(values: list[float]) -> dict[str, float | int]:
+    if not values:
+        return {"count": 0}
+    return {
+        "count": len(values),
+        "min": min(values),
+        "max": max(values),
+        "mean": sum(values) / len(values),
+        "median": percentile(values, 0.5),
+        "p25": percentile(values, 0.25),
+        "p75": percentile(values, 0.75),
+        "p95": percentile(values, 0.95),
+    }
+
+
+def rectangle_objects(annotation: dict[str, object]) -> list[tuple[str, float]]:
+    objects: list[tuple[str, float]] = []
+    results = annotation.get("result", [])
+    if not isinstance(results, list):
+        return objects
+    for result in results:
+        if not isinstance(result, dict) or result.get("type") != "rectanglelabels":
+            continue
+        value = result.get("value", {})
+        if not isinstance(value, dict):
+            continue
+        labels = value.get("rectanglelabels", [])
+        if not isinstance(labels, list):
+            continue
+        try:
+            area_fraction = (float(value["width"]) * float(value["height"])) / 10_000
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not 0 < area_fraction <= 1:
+            continue
+        for label in labels:
+            if isinstance(label, str):
+                objects.append((label, area_fraction))
+    return objects
+
+
+def storage_archive_summary(
+    storage_name: str,
+    entries: list[tuple[Path, dict[str, object], dict[str, object] | None, bytes]],
+) -> tuple[dict[str, object], str, str, str]:
+    tag_image_counts: dict[str, int] = defaultdict(int)
+    object_counts: dict[str, int] = defaultdict(int)
+    object_areas: list[float] = []
+    image_widths: list[float] = []
+    image_heights: list[float] = []
+    image_bytes: list[float] = []
+    aspect_ratios: list[float] = []
+    image_rows: list[dict[str, object]] = []
+    for relative_path, task, annotation, data in entries:
+        with Image.open(io.BytesIO(data)) as image:
+            width, height = image.size
+        image_widths.append(width)
+        image_heights.append(height)
+        image_bytes.append(len(data))
+        if height:
+            aspect_ratios.append(width / height)
+        tags = task_current_tags(task) if annotation else []
+        for tag in tags:
+            tag_image_counts[tag] += 1
+        objects = rectangle_objects(annotation) if annotation else []
+        for label, area_fraction in objects:
+            object_counts[label] += 1
+            object_areas.append(area_fraction)
+        image_rows.append(
+            {
+                "image_path": relative_path.as_posix(),
+                "width": width,
+                "height": height,
+                "bytes": len(data),
+                "aspect_ratio": width / height if height else None,
+                "tag_count": len(tags),
+                "object_count": len(objects),
+            }
+        )
+    summary: dict[str, object] = {
+        "schema_version": ARCHIVE_SCHEMA_VERSION,
+        "storage_name": storage_name,
+        "images": {
+            "count": len(entries),
+            "width_pixels": distribution(image_widths),
+            "height_pixels": distribution(image_heights),
+            "bytes": distribution(image_bytes),
+            "aspect_ratio": distribution(aspect_ratios),
+        },
+        "tags": {"image_count_by_tag": dict(sorted(tag_image_counts.items()))},
+        "objects": {
+            "count": sum(object_counts.values()),
+            "count_by_label": dict(sorted(object_counts.items())),
+            "bounding_box_area_fraction_of_image": distribution(object_areas),
+        },
+    }
+    return (
+        summary,
+        analytics_csv([{"tag": tag, "image_count": count} for tag, count in sorted(tag_image_counts.items())]),
+        analytics_csv([{"label": label, "object_count": count} for label, count in sorted(object_counts.items())]),
+        analytics_csv(image_rows),
+    )
+
+
+def build_storage_archive(
+    selected_storages: list[dict[str, object]],
+    tasks_by_storage: dict[int, list[dict[str, object]]],
+    include_unannotated: bool,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+) -> tuple[Path, int]:
+    export_items: list[tuple[dict[str, object], Path, dict[str, object], dict[str, object] | None]] = []
+    for storage in selected_storages:
+        for task in tasks_by_storage.get(int(storage["id"]), []):
+            annotation = completed_annotation(task)
+            if annotation is None and not include_unannotated:
+                continue
+            export_items.append((storage, task_storage_relative_path(task, storage), task, annotation))
+    if not export_items:
+        raise ValueError("No images match the export selection.")
+    EXPORT_ROOT.mkdir(parents=True, exist_ok=True)
+    archive_fd, archive_path_str = tempfile.mkstemp(suffix=".zip", dir=EXPORT_ROOT)
+    os.close(archive_fd)
+    archive_path = Path(archive_path_str)
+    archive_path.chmod(0o644)
+    entries_by_storage: dict[int, list[tuple[Path, dict[str, object], dict[str, object] | None, bytes]]] = defaultdict(list)
+    with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as zip_file:
+        for index, (storage, relative_path, task, annotation) in enumerate(export_items, start=1):
+            data, _ = image_bytes(task)
+            zip_file.writestr(archive_member_path(storage_archive_name(storage), relative_path), data)
+            entries_by_storage[int(storage["id"])].append((relative_path, task, annotation, data))
+            if progress_callback:
+                progress_callback(index, len(export_items), relative_path.name)
+        archive_manifest: dict[str, object] = {
+            "schema_version": ARCHIVE_SCHEMA_VERSION,
+            "storage_count": len(selected_storages),
+            "storages": [],
+        }
+        for storage in selected_storages:
+            storage_id = int(storage["id"])
+            storage_name = storage_archive_name(storage)
+            entries = entries_by_storage[storage_id]
+            native_annotations = []
+            image_tags = {}
+            coco_images = []
+            coco_annotations = []
+            category_names: set[str] = set()
+            annotation_id = 1
+            for image_id, (relative_path, task, annotation, _) in enumerate(entries, start=1):
+                image_tags[relative_path.as_posix()] = task_current_tags(task) if annotation else []
+                native_annotations.append(
+                    {
+                        "image_path": relative_path.as_posix(),
+                        "result": annotation.get("result", []) if annotation else [],
+                    }
+                )
+                image_data, _ = image_bytes(task)
+                with Image.open(io.BytesIO(image_data)) as image:
+                    width, height = image.size
+                coco_images.append({"id": image_id, "file_name": relative_path.as_posix(), "width": width, "height": height})
+                for label, _ in rectangle_objects(annotation) if annotation else []:
+                    category_names.add(label)
+                for result in (annotation or {}).get("result", []):
+                    if not isinstance(result, dict) or result.get("type") != "rectanglelabels":
+                        continue
+                    value = result.get("value", {})
+                    if not isinstance(value, dict):
+                        continue
+                    labels = value.get("rectanglelabels", [])
+                    if not isinstance(labels, list):
+                        continue
+                    try:
+                        x = float(value["x"]) * width / 100
+                        y = float(value["y"]) * height / 100
+                        box_width = float(value["width"]) * width / 100
+                        box_height = float(value["height"]) * height / 100
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    for label in labels:
+                        if isinstance(label, str):
+                            coco_annotations.append(
+                                {"id": annotation_id, "image_id": image_id, "category_name": label, "bbox": [x, y, box_width, box_height], "area": box_width * box_height, "iscrowd": 0}
+                            )
+                            annotation_id += 1
+            categories = [{"id": index, "name": name} for index, name in enumerate(sorted(category_names), start=1)]
+            category_ids = {category["name"]: category["id"] for category in categories}
+            for item in coco_annotations:
+                item["category_id"] = category_ids[str(item.pop("category_name"))]
+            summary, tags_csv, objects_csv, images_csv = storage_archive_summary(storage_name, entries)
+            root = f"{storage_name}/"
+            zip_file.writestr(root + "annotations/label-studio.json", json.dumps(native_annotations, indent=2))
+            zip_file.writestr(root + "annotations/coco.json", json.dumps({"images": coco_images, "annotations": coco_annotations, "categories": categories}, indent=2))
+            zip_file.writestr(root + "tags/image-tags.json", json.dumps(image_tags, indent=2))
+            zip_file.writestr(root + "summary/summary.json", json.dumps(summary, indent=2))
+            zip_file.writestr(root + "summary/tags.csv", tags_csv)
+            zip_file.writestr(root + "summary/objects.csv", objects_csv)
+            zip_file.writestr(root + "summary/images.csv", images_csv)
+            archive_manifest["storages"].append({"name": storage_name, "image_count": len(entries)})
+        zip_file.writestr("manifest.json", json.dumps(archive_manifest, indent=2))
+    return archive_path, len(export_items)
+
+
+def safe_zip_members(zip_file: zipfile.ZipFile) -> list[zipfile.ZipInfo]:
+    members = [member for member in zip_file.infolist() if not member.is_dir()]
+    total_size = sum(member.file_size for member in members)
+    if total_size > MAX_ARCHIVE_UNCOMPRESSED_BYTES:
+        raise ValueError("Archive exceeds the 10 GB uncompressed import limit.")
+    for member in members:
+        path = Path(member.filename)
+        if path.is_absolute() or ".." in path.parts:
+            raise ValueError(f"Archive contains an unsafe path: {member.filename}")
+    return members
+
+
+def archive_storage_root(archive: zipfile.ZipFile) -> str:
+    members = safe_zip_members(archive)
+    try:
+        manifest = json.loads(archive.read("manifest.json"))
+    except KeyError:
+        roots = {Path(member.filename).parts[0] for member in members}
+        if len(roots) != 1:
+            raise ValueError(
+                "Archive without manifest.json must contain exactly one top-level storage folder."
+            )
+        return roots.pop()
+    except json.JSONDecodeError as error:
+        raise ValueError("Archive has an invalid manifest.json.") from error
+
+    storages = manifest.get("storages", []) if isinstance(manifest, dict) else []
+    if not isinstance(storages, list) or len(storages) != 1:
+        raise ValueError("Import accepts an archive containing exactly one storage.")
+    storage_name = storages[0].get("name") if isinstance(storages[0], dict) else None
+    if (
+        not isinstance(storage_name, str)
+        or not storage_name
+        or safe_filename(storage_name) != storage_name
+    ):
+        raise ValueError("Archive manifest has no valid storage name.")
+    return storage_name
+
+
+def imported_archive_data(uploaded_file: object) -> tuple[str, list[dict[str, object]], dict[str, list[str]], zipfile.ZipFile]:
+    if not hasattr(uploaded_file, "read"):
+        raise ValueError("Choose a ZIP archive to import.")
+    archive = zipfile.ZipFile(uploaded_file)
+    try:
+        storage_name = archive_storage_root(archive)
+        annotations = json.loads(archive.read(f"{storage_name}/annotations/label-studio.json"))
+        tags = json.loads(archive.read(f"{storage_name}/tags/image-tags.json"))
+    except (KeyError, json.JSONDecodeError) as error:
+        archive.close()
+        raise ValueError("Archive is missing valid Label Studio annotations or tags.") from error
+    except ValueError:
+        archive.close()
+        raise
+    if not isinstance(annotations, list) or not isinstance(tags, dict):
+        archive.close()
+        raise ValueError("Archive annotations or tags have an invalid format.")
+    return storage_name, annotations, {str(key): value for key, value in tags.items() if isinstance(value, list)}, archive
+
+
+def import_storage_archive(uploaded_file: object, new_storage_name: str) -> dict[str, int]:
+    new_storage_name = new_storage_name.strip()
+    if safe_filename(new_storage_name) != new_storage_name:
+        raise ValueError("Storage name may contain only letters, numbers, underscores, and hyphens.")
+    load_storages.clear()
+    existing_storages = load_storages(selected_instance_key())
+    if any(str(storage.get("title")) == new_storage_name for storage in existing_storages):
+        raise ValueError(f'A storage named "{new_storage_name}" already exists.')
+    source_storage_name, annotations, tags_by_path, archive = imported_archive_data(uploaded_file)
+    try:
+        known_tags = set(available_tags(load_label_config()))
+        archive_tags = {tag for tags in tags_by_path.values() for tag in tags if isinstance(tag, str)}
+        missing_tags = sorted(archive_tags - known_tags)
+        if missing_tags:
+            raise ValueError("Target project is missing archive tags: " + ", ".join(missing_tags))
+        destination = selected_instance().data_dir / "images" / new_storage_name
+        if destination.exists():
+            raise ValueError(f'Local directory for "{new_storage_name}" already exists.')
+        if not any(
+            member.filename.startswith(f"{source_storage_name}/images/")
+            for member in safe_zip_members(archive)
+        ):
+            raise ValueError("Archive contains no images.")
+        client = label_studio_client()
+        destination.mkdir(parents=True)
+        storage_id: int | None = None
+        try:
+            for member in safe_zip_members(archive):
+                prefix = f"{source_storage_name}/images/"
+                if member.filename.startswith(prefix):
+                    relative_path = Path(member.filename[len(prefix):])
+                    target = destination / relative_path
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    with archive.open(member) as source, target.open("wb") as output:
+                        shutil.copyfileobj(source, output)
+            storage = client.import_storage.local.create(
+                project=selected_instance().project_id,
+                title=new_storage_name,
+                path=f"/label-studio/data/images/{new_storage_name}",
+                use_blob_urls=True,
+            )
+            storage_data = sdk_dict(storage)
+            storage_id = int(storage_data["id"])
+            client.import_storage.local.sync(storage_id)
+        except (OSError,) + LS_API_ERRORS:
+            if storage_id is not None:
+                client.import_storage.local.delete(storage_id)
+            shutil.rmtree(destination)
+            raise
+        load_storages.clear()
+        load_project_tasks.clear()
+        synced_tasks = load_project_tasks(selected_instance_key())
+        imported_tasks = [
+            task for task in synced_tasks
+            if task_belongs_to_storage(task, {"id": storage_id, "title": new_storage_name, "path": f"/label-studio/data/images/{new_storage_name}"})
+        ]
+        tasks_by_path = {}
+        for task in imported_tasks:
+            reference = task_image_reference(task) or ""
+            image_path = unquote(reference.split("?d=", 1)[1]) if "?d=" in reference else reference
+            marker = f"images/{new_storage_name}/"
+            if marker in image_path:
+                tasks_by_path[image_path.split(marker, 1)[1]] = task
+        unmatched_paths = sorted(set(tags_by_path) - set(tasks_by_path))
+        if unmatched_paths:
+            client.import_storage.local.delete(storage_id)
+            shutil.rmtree(destination)
+            load_storages.clear()
+            load_project_tasks.clear()
+            raise RuntimeError(
+                f"Storage sync did not create tasks for {len(unmatched_paths)} archived image(s), "
+                f"including {unmatched_paths[0]}."
+            )
+        annotation_by_path = {
+            item.get("image_path"): item.get("result", [])
+            for item in annotations
+            if isinstance(item, dict) and isinstance(item.get("image_path"), str) and isinstance(item.get("result"), list)
+        }
+        created = 0
+        skipped = 0
+        for image_path, task in tasks_by_path.items():
+            result = annotation_by_path.get(image_path)
+            if result is None:
+                skipped += 1
+                continue
+            client.annotations.create(int(task["id"]), result=result, project=selected_instance().project_id)
+            created += 1
+        return {"images": len(tasks_by_path), "annotations_created": created, "without_annotations": skipped}
+    finally:
+        archive.close()
 
 
 def natural_sort_key(value: str) -> list[tuple[int, int | str]]:
@@ -1080,7 +1543,7 @@ def render_frame_extractor() -> None:
     save_column, cancel_column = st.columns(2)
     with save_column:
         if st.button("Save frames", type="primary", disabled=not kept_paths):
-            target_dir = IMAGES_DIR / target_name if target_name else None
+            target_dir = selected_instance().data_dir / "images" / target_name if target_name else None
             if target_dir is None:
                 st.error("Enter a valid folder name.")
             elif target_dir.exists():
@@ -1108,11 +1571,11 @@ def render_dataset_export() -> None:
     st.caption(f"Data source: {DATA_SOURCE.upper()} (set DATA_SOURCE=api or DATA_SOURCE=postgres in .env to switch manually)")
     try:
         with st.spinner("Loading Local Files storages and annotation statistics..."):
-            storages = load_storages()
+            storages = load_storages(selected_instance_key())
             if not storages:
                 st.warning("No Local Files storages were found.")
                 return
-            tasks = load_project_tasks(LABEL_STUDIO_PROJECT_ID)
+            tasks = load_project_tasks(selected_instance_key())
             tags = available_tags(load_label_config())
             tasks_by_storage: dict[int, list[dict[str, object]]] = defaultdict(list)
             for task in tasks:
@@ -1325,6 +1788,129 @@ def render_dataset_export() -> None:
         st.caption(f"Ready: {counts.get('train', 0)} train, {counts.get('valid', 0)} validation, {counts.get('test', 0)} test images.")
 
 
+def render_storage_archive() -> None:
+    st.title("Storage archive")
+    st.caption(
+        "Export Local Files storages with source images, Label Studio annotations, COCO annotations, "
+        "image tags, and summary statistics. Import accepts exactly one exported storage per archive."
+    )
+    try:
+        with st.spinner("Loading Local Files storages..."):
+            storages = load_storages(selected_instance_key())
+            tasks = load_project_tasks(selected_instance_key())
+    except LS_API_ERRORS + (psycopg.Error,) as error:
+        st.error(f"Failed to load Local Files storages: {error}")
+        return
+    if not storages:
+        st.warning("No Local Files storages were found.")
+        return
+    tasks_by_storage = tasks_grouped_by_storage(storages, tasks)
+    labels = {
+        int(storage["id"]): str(storage.get("title") or f"Storage {storage['id']}")
+        for storage in storages
+    }
+    rows = [
+        {
+            "Storage": labels[int(storage["id"])],
+            "Images": len(tasks_by_storage.get(int(storage["id"]), [])),
+            "Annotated": sum(
+                completed_annotation(task) is not None
+                for task in tasks_by_storage.get(int(storage["id"]), [])
+            ),
+        }
+        for storage in storages
+    ]
+    st.dataframe(rows, use_container_width=True, hide_index=True)
+
+    st.subheader("Export storage archive")
+    selected_ids = st.multiselect(
+        "Storages to export",
+        options=list(labels),
+        default=list(labels),
+        format_func=labels.get,
+        key="storage_archive_export_ids",
+    )
+    selected_storages = [storage for storage in storages if int(storage["id"]) in selected_ids]
+    include_unannotated = st.checkbox(
+        "Include all images, including images without annotations",
+        value=False,
+        key="storage_archive_include_unannotated",
+        help="When unchecked, images without a completed annotation are excluded from the archive.",
+    )
+    selected_tasks = [
+        task
+        for storage in selected_storages
+        for task in tasks_by_storage.get(int(storage["id"]), [])
+    ]
+    selected_count = (
+        len(selected_tasks)
+        if include_unannotated
+        else sum(completed_annotation(task) is not None for task in selected_tasks)
+    )
+    st.caption(
+        f"{selected_count} image(s) will be exported."
+        if include_unannotated
+        else f"{selected_count} annotated image(s) will be exported; images without annotations will be skipped."
+    )
+    if st.button(
+        "Build storage archive",
+        type="primary",
+        disabled=not selected_storages or not selected_count or st.session_state.get("storage_archive_exporting", False),
+    ):
+        st.session_state.storage_archive_exporting = True
+        progress = st.progress(0.0, text="Preparing storage archive...")
+        status = st.empty()
+
+        def update_progress(completed: int, total: int, name: str) -> None:
+            progress.progress(completed / total, text=f"Archiving image {completed} of {total}...")
+            status.caption(f"Current file: {name}")
+
+        try:
+            archive_path, image_count = build_storage_archive(
+                selected_storages,
+                tasks_by_storage,
+                include_unannotated,
+                progress_callback=update_progress,
+            )
+            if old_path := st.session_state.get("storage_archive_path"):
+                Path(old_path).unlink(missing_ok=True)
+            st.session_state.storage_archive_path = str(archive_path)
+            st.session_state.storage_archive_image_count = image_count
+        except LS_API_ERRORS + (OSError, ValueError, zipfile.BadZipFile) as error:
+            st.error(f"Storage archive export failed: {error}")
+        finally:
+            st.session_state.storage_archive_exporting = False
+    if archive_path := st.session_state.get("storage_archive_path"):
+        st.link_button(
+            "Download storage archive (.zip)",
+            f"/dataset-hub/downloads/{Path(archive_path).name}",
+            type="primary",
+        )
+        st.caption(f"Ready: {st.session_state.get('storage_archive_image_count', 0)} image(s).")
+
+    st.divider()
+    st.subheader("Import one storage archive")
+    st.caption(
+        "The archive must contain one storage. The requested storage name must be new and all archive tags "
+        "must already exist in the active project."
+    )
+    with st.form("storage_archive_import", clear_on_submit=True):
+        uploaded_file = st.file_uploader("Storage archive (.zip)", type=["zip"])
+        new_storage_name = st.text_input("New storage name")
+        submit_import = st.form_submit_button("Upload, sync, and import annotations", type="primary")
+    if submit_import:
+        try:
+            with st.spinner("Uploading images, syncing Local Files storage, and importing annotations..."):
+                result = import_storage_archive(uploaded_file, new_storage_name)
+            st.success(
+                f'Imported "{new_storage_name}": {result["images"]} images synced, '
+                f'{result["annotations_created"]} annotations created, '
+                f'{result["without_annotations"]} images without annotations.'
+            )
+        except LS_API_ERRORS + (OSError, ValueError, zipfile.BadZipFile, json.JSONDecodeError) as error:
+            st.error(f"Storage archive import failed: {error}")
+
+
 def render_tag_settings() -> None:
     st.title("Tag settings")
     st.caption('Manage the list of available image tags (the <Choices name="tags"> block in the labeling template).')
@@ -1358,8 +1944,8 @@ def render_tag_settings() -> None:
     if remove_selection:
         try:
             with st.spinner("Checking tag usage across storages..."):
-                storages = load_storages()
-                tasks = load_project_tasks(LABEL_STUDIO_PROJECT_ID)
+                storages = load_storages(selected_instance_key())
+                tasks = load_project_tasks(selected_instance_key())
             tasks_by_storage = tasks_grouped_by_storage(storages, tasks)
         except LS_API_ERRORS + (psycopg.Error,) as error:
             st.error(f"Failed to check tag usage: {error}")
@@ -1426,11 +2012,11 @@ def render_manage_tags() -> None:
     try:
         tags = available_tags(load_label_config())
         with st.spinner("Loading storages and tasks..."):
-            storages = load_storages()
+            storages = load_storages(selected_instance_key())
             if not storages:
                 st.warning("No Local Files storages were found.")
                 return
-            tasks = load_project_tasks(LABEL_STUDIO_PROJECT_ID)
+            tasks = load_project_tasks(selected_instance_key())
     except LS_API_ERRORS + (psycopg.Error,) as error:
         st.error(f"Failed to load data: {error}")
         return
@@ -1488,13 +2074,22 @@ def render_manage_tags() -> None:
 def main() -> None:
     st.set_page_config(page_title="Dataset Hub", layout="wide")
     st.sidebar.header("Dataset Hub")
-    frame_tab, export_tab, manage_tags_tab, tag_settings_tab = st.tabs(
-        ["Frame extraction", "Dataset export", "Manage tags", "Tag settings"]
+    instance_key = st.sidebar.selectbox(
+        "Label Studio instance",
+        options=list(LABEL_STUDIO_INSTANCES),
+        format_func=lambda key: LABEL_STUDIO_INSTANCES[key].label,
+        key="label_studio_instance",
+    )
+    st.sidebar.caption(f"Project {LABEL_STUDIO_INSTANCES[instance_key].project_id}")
+    frame_tab, export_tab, storage_archive_tab, manage_tags_tab, tag_settings_tab = st.tabs(
+        ["Frame extraction", "Dataset export", "Storage archive", "Manage tags", "Tag settings"]
     )
     with frame_tab:
         render_frame_extractor()
     with export_tab:
         render_dataset_export()
+    with storage_archive_tab:
+        render_storage_archive()
     with manage_tags_tab:
         render_manage_tags()
     with tag_settings_tab:

@@ -5,6 +5,8 @@
 # Runtime state and data
 mydata/
 postgres-data/
+freelance-data/
+freelance-postgres-data/
 models/
 coco-dataset/
 dataset-hub-exports/

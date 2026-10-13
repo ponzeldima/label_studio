@@ -10,16 +10,27 @@
      <Header value="Tags" style="font-size: 14px; margin-bottom: 5px;"/>
     <Choices name="tags" toName="image" choice="multiple" layout="vertical">
         <Choice value="d_3_5"/>
-        <Choice value="summer"/>
-        <Choice value="sunny"/>
-        <Choice value="sunset"/>
+        <Choice value="d_10"/>
+        <Choice value="d_8"/>
+        <Choice value="d_13"/>
+        <Choice value="d_11_opto"/>
+        <Choice value="d_unknown"/>
+        <Choice value="d_with_duct"/>
+        <Choice value="d_6_unknown"/>
+        <Choice value="d_8_unknown"/>
+        <Choice value="winter"/>
         <Choice value="cloudy"/>
+        <Choice value="sunset"/>
+        <Choice value="night"/>
         <Choice value="b_green"/>
-        <Choice value="day"/>
         <Choice value="b_sky"/>
         <Choice value="b_building"/>
+        <Choice value="b_ground"/>
+        <Choice value="b_person"/>
         <Choice value="ir"/>
-        <Choice value="b_ground"/>    
+        <Choice value="partial"/>
+        <Choice value="occluded"/>
+        <Choice value="synthetic"/>
     </Choices>
 
     <Header value="Classes" style="font-size: 14px; margin-top: 15px; margin-bottom: 5px;"/>

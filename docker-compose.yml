@@ -34,6 +34,48 @@ services:
     volumes:
       - ./postgres-data:/var/lib/postgresql/data
 
+  app-freelance:
+    image: heartexlabs/label-studio:1.23.0
+    environment:
+      - JSON_LOG=${JSON_LOG:-1}
+
+      # Dedicated PostgreSQL database; never point this service at the main db.
+      - DJANGO_DB=default
+      - POSTGRE_NAME=${FREELANCE_POSTGRES_DB:-postgres}
+      - POSTGRE_USER=${FREELANCE_POSTGRES_USER:-postgres}
+      - POSTGRE_PASSWORD=${FREELANCE_POSTGRES_PASSWORD:?Set FREELANCE_POSTGRES_PASSWORD in .env}
+      - POSTGRE_HOST=db-freelance
+      - POSTGRE_PORT=5432
+
+      # Label Studio
+      - LABEL_STUDIO_DISABLE_SIGNUP_WITHOUT_LINK=${LABEL_STUDIO_DISABLE_SIGNUP_WITHOUT_LINK:-true}
+      - LOCAL_FILES_SERVING_ENABLED=true
+      - LOCAL_FILES_DOCUMENT_ROOT=/label-studio/data
+      - LABEL_STUDIO_LOCAL_FILES_DOCUMENT_ROOT=/label-studio/data
+      - CSRF_TRUSTED_ORIGINS=https://ponzel-vision.westeurope.cloudapp.azure.com:8443
+    volumes:
+      - ./freelance-data:/label-studio/data
+    depends_on:
+      db-freelance:
+        condition: service_started
+      freelance-data-init:
+        condition: service_completed_successfully
+
+  db-freelance:
+    image: postgres:15
+    environment:
+      - POSTGRES_USER=${FREELANCE_POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${FREELANCE_POSTGRES_PASSWORD:?Set FREELANCE_POSTGRES_PASSWORD in .env}
+      - POSTGRES_DB=${FREELANCE_POSTGRES_DB:-postgres}
+    volumes:
+      - ./freelance-postgres-data:/var/lib/postgresql/data
+
+  freelance-data-init:
+    image: alpine:3.20
+    command: ["sh", "-c", "chgrp 0 /label-studio/data && chmod 2775 /label-studio/data"]
+    volumes:
+      - ./freelance-data:/label-studio/data
+
   ml:
     build:
       context: ./ml
@@ -52,6 +94,24 @@ services:
     depends_on:
       - app
 
+  ml-freelance:
+    build:
+      context: ./ml
+    environment:
+      - WORKERS=1
+      - THREADS=4
+      - TIMEOUT=300
+      - GUNICORN_TIMEOUT=300
+      - MODEL_DIR=/app/models
+      - YOLO_MODEL=best.pt
+      - FORCE_CPU=true
+      - DATA_ROOT=/app/data
+    volumes:
+      - ./models:/app/models:ro
+      - ./freelance-data:/app/data:ro
+    depends_on:
+      - app-freelance
+
   dataset-hub:
     build:
       context: ./dataset-hub
@@ -59,6 +119,8 @@ services:
     memswap_limit: 2g
     environment:
       - DATA_DIR=/data
+      - MAIN_DATA_DIR=/data/main
+      - FREELANCE_DATA_DIR=/data/freelance
       - DATA_SOURCE=${DATA_SOURCE:-api}
       - LABEL_STUDIO_URL=http://app:8080
       - LABEL_STUDIO_API_TOKEN=${LABEL_STUDIO_API_TOKEN:-}
@@ -68,8 +130,17 @@ services:
       - POSTGRES_USER=${POSTGRES_USER:-postgres}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
       - POSTGRES_PORT=${POSTGRES_PORT:-5432}
+      - FREELANCE_LABEL_STUDIO_URL=http://app-freelance:8080
+      - FREELANCE_LABEL_STUDIO_API_TOKEN=${FREELANCE_LABEL_STUDIO_API_TOKEN:-}
+      - FREELANCE_LABEL_STUDIO_PROJECT_ID=${FREELANCE_LABEL_STUDIO_PROJECT_ID:-1}
+      - FREELANCE_POSTGRES_HOST=db-freelance
+      - FREELANCE_POSTGRES_DB=${FREELANCE_POSTGRES_DB:-postgres}
+      - FREELANCE_POSTGRES_USER=${FREELANCE_POSTGRES_USER:-postgres}
+      - FREELANCE_POSTGRES_PASSWORD=${FREELANCE_POSTGRES_PASSWORD:?Set FREELANCE_POSTGRES_PASSWORD in .env}
+      - FREELANCE_POSTGRES_PORT=5432
     volumes:
-      - ./mydata:/data
+      - ./mydata:/data/main
+      - ./freelance-data:/data/freelance
       - dataset-hub-exports:/tmp/dataset-export
 
   dataset-hub-proxy:
@@ -88,12 +159,14 @@ services:
     ports:
       - "80:80"
       - "443:443"
+      - "8443:8443"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
       - caddy-config:/config
     depends_on:
       - app
+      - app-freelance
       - dataset-hub-proxy
 
 volumes:

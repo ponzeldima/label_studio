@@ -41,7 +41,7 @@ The public TLS endpoint is configured for
 `ponzel-vision.westeurope.cloudapp.azure.com`. Before starting the updated stack:
 
 1. Ensure the Azure DNS hostname resolves to the Azure load-balancer public IP.
-2. In Azure, forward inbound TCP ports 80 and 443 to this VM and allow them in
+2. In Azure, forward inbound TCP ports 80, 443, and 8443 to this VM and allow them in
    the VM's network security group. Remove public forwarding for ports 8080,
    8501, and 9090.
 3. Restrict the credentials file to the deployment account:
@@ -62,6 +62,63 @@ available at `https://ponzel-vision.westeurope.cloudapp.azure.com`; the
 authenticated dataset hub is at
 `https://ponzel-vision.westeurope.cloudapp.azure.com/dataset-hub/`. Only Caddy
 publishes host ports.
+
+## Freelancer annotation instance
+
+The Compose stack includes an isolated Label Studio instance for freelancers:
+`app-freelance`, `db-freelance`, and `ml-freelance`. It has no access to the
+main instance database or `mydata/` directory.
+
+1. Add a unique `FREELANCE_POSTGRES_PASSWORD` to `.env`. No extra DNS record
+   is required; the instance uses the existing hostname on HTTPS port 8443.
+2. Create `freelance-data/images/` and copy only the selected images into it.
+   Do not use a symlink to `mydata/`. Compose prepares the directory permissions
+   automatically before the freelancer app starts.
+3. Start the new services with `docker compose up --build -d`.
+4. Visit `https://ponzel-vision.westeurope.cloudapp.azure.com:8443`, create
+   the administrator account, then create a project using the label configuration in
+   `temaplate.xml`. Configure local-file storage at `/label-studio/data/images`
+   or import tasks whose image URLs use `/data/local-files/?d=images/...`.
+5. In that project, add the ML backend URL `http://ml-freelance:9090`. This
+   backend reads only `freelance-data/` and shares the main YOLO weights as a
+   read-only mount.
+
+Freelancer accounts should be invited only to this second instance. The
+dataset hub remains authenticated separately from both Label Studio instances.
+
+## Dataset Hub instance selector
+
+Dataset Hub can work with either Label Studio instance. Its sidebar has a
+**Label Studio instance** selector that switches all frame extraction, dataset
+export, and tag management actions between the main and freelancer projects.
+
+Set `FREELANCE_LABEL_STUDIO_API_TOKEN` in `.env` to an API token created by the
+freelancer-instance administrator. Set `FREELANCE_LABEL_STUDIO_PROJECT_ID` if
+the freelancer project is not project `1`. Restart Dataset Hub after changing
+these values:
+
+```bash
+docker compose up -d --build dataset-hub dataset-hub-proxy
+```
+
+## Storage archive transfer
+
+The Dataset Hub **Storage archive** tab exports one or more Local Files
+storages. Each storage folder in the ZIP contains source images, native Label
+Studio annotations, COCO annotations, image tags, and JSON/CSV summary
+statistics. By default the export excludes images without completed
+annotations; select **Include all images, including images without
+annotations** to include them.
+
+Imports accept an archive containing exactly one storage. A `manifest.json` is
+optional: without one, the ZIP must contain exactly one top-level folder with
+`images/`, `annotations/label-studio.json`, and `tags/image-tags.json`, as in
+an exported storage folder. Choose the archive and a new storage name in the
+same tab. The name must not already exist, and all archive tags must already
+be present in the active project's tag configuration. Dataset Hub extracts the
+images to `mydata/images/<new-storage-name>/` directly (without an additional
+`images/` subfolder), creates and syncs the Local Files storage, then imports
+the native annotations and tags.
 
 ## Back up before upgrades or database changes
 
