@@ -106,9 +106,19 @@ docker compose up -d --build dataset-hub dataset-hub-proxy
 The Dataset Hub **Storage archive** tab exports one or more Local Files
 storages. Each storage folder in the ZIP contains source images, native Label
 Studio annotations, COCO annotations, image tags, and JSON/CSV summary
-statistics. By default the export excludes images without completed
-annotations; select **Include all images, including images without
-annotations** to include them.
+statistics. The archive also includes `annotations/image-status.json`, and
+each native annotation record, COCO image record, and `summary/images.csv` row
+contains an `annotation_status` value:
+
+- `unannotated`: no completed Label Studio annotation exists;
+- `background_only`: a completed annotation exists but contains no objects;
+- `annotated`: a completed annotation contains one or more objects.
+
+COCO object annotations remain standard: background-only images have no fake
+bounding boxes or background objects. The status metadata is required to
+distinguish them from unannotated images. By default the export excludes
+images without completed annotations; select **Include all images, including
+images without annotations** to include them.
 
 Imports accept an archive containing exactly one storage. A `manifest.json` is
 optional: without one, the ZIP must contain exactly one top-level folder with

@@ -33,7 +33,7 @@ from streamlit_cropper import st_cropper
 STAGING_ROOT = Path("/tmp/frame-staging")
 UPLOAD_ROOT = Path("/tmp/frame-uploads")
 EXPORT_ROOT = Path("/tmp/dataset-export")
-ARCHIVE_SCHEMA_VERSION = 1
+ARCHIVE_SCHEMA_VERSION = 2
 MAX_ARCHIVE_UNCOMPRESSED_BYTES = 10 * 1024 * 1024 * 1024
 FRAMES_PER_PAGE = 24
 MAX_SUBFOLDER_LENGTH = 80
@@ -593,6 +593,12 @@ def rectangle_objects(annotation: dict[str, object]) -> list[tuple[str, float]]:
     return objects
 
 
+def annotation_status(annotation: dict[str, object] | None) -> str:
+    if annotation is None:
+        return "unannotated"
+    return "annotated" if rectangle_objects(annotation) else "background_only"
+
+
 def storage_archive_summary(
     storage_name: str,
     entries: list[tuple[Path, dict[str, object], dict[str, object] | None, bytes]],
@@ -613,10 +619,10 @@ def storage_archive_summary(
         image_bytes.append(len(data))
         if height:
             aspect_ratios.append(width / height)
-        tags = task_current_tags(task) if annotation else []
+        tags = task_current_tags(task) if annotation is not None else []
         for tag in tags:
             tag_image_counts[tag] += 1
-        objects = rectangle_objects(annotation) if annotation else []
+        objects = rectangle_objects(annotation) if annotation is not None else []
         for label, area_fraction in objects:
             object_counts[label] += 1
             object_areas.append(area_fraction)
@@ -629,6 +635,7 @@ def storage_archive_summary(
                 "aspect_ratio": width / height if height else None,
                 "tag_count": len(tags),
                 "object_count": len(objects),
+                "annotation_status": annotation_status(annotation),
             }
         )
     summary: dict[str, object] = {
@@ -695,22 +702,38 @@ def build_storage_archive(
             entries = entries_by_storage[storage_id]
             native_annotations = []
             image_tags = {}
+            image_status = {}
             coco_images = []
             coco_annotations = []
             category_names: set[str] = set()
             annotation_id = 1
             for image_id, (relative_path, task, annotation, _) in enumerate(entries, start=1):
-                image_tags[relative_path.as_posix()] = task_current_tags(task) if annotation else []
+                relative_name = relative_path.as_posix()
+                status = annotation_status(annotation)
+                image_tags[relative_name] = task_current_tags(task) if annotation is not None else []
+                image_status[relative_name] = {
+                    "annotation_status": status,
+                    "object_count": len(rectangle_objects(annotation)) if annotation is not None else 0,
+                }
                 native_annotations.append(
                     {
-                        "image_path": relative_path.as_posix(),
+                        "image_path": relative_name,
                         "result": annotation.get("result", []) if annotation else [],
+                        "annotation_status": status,
                     }
                 )
                 image_data, _ = image_bytes(task)
                 with Image.open(io.BytesIO(image_data)) as image:
                     width, height = image.size
-                coco_images.append({"id": image_id, "file_name": relative_path.as_posix(), "width": width, "height": height})
+                coco_images.append(
+                    {
+                        "id": image_id,
+                        "file_name": relative_name,
+                        "width": width,
+                        "height": height,
+                        "annotation_status": status,
+                    }
+                )
                 for label, _ in rectangle_objects(annotation) if annotation else []:
                     category_names.add(label)
                 for result in (annotation or {}).get("result", []):
@@ -743,6 +766,7 @@ def build_storage_archive(
             root = f"{storage_name}/"
             zip_file.writestr(root + "annotations/label-studio.json", json.dumps(native_annotations, indent=2))
             zip_file.writestr(root + "annotations/coco.json", json.dumps({"images": coco_images, "annotations": coco_annotations, "categories": categories}, indent=2))
+            zip_file.writestr(root + "annotations/image-status.json", json.dumps(image_status, indent=2))
             zip_file.writestr(root + "tags/image-tags.json", json.dumps(image_tags, indent=2))
             zip_file.writestr(root + "summary/summary.json", json.dumps(summary, indent=2))
             zip_file.writestr(root + "summary/tags.csv", tags_csv)
